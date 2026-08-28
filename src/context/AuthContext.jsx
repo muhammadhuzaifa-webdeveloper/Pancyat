@@ -3,6 +3,14 @@ import { supabase } from '../lib/supabaseClient'
 
 const AuthContext = createContext(undefined)
 
+// Superadmin is a superset of "admin" everywhere in the UI/routes.
+function roleSatisfies(actualRole, requiredRole) {
+  if (!requiredRole) return true
+  if (actualRole === requiredRole) return true
+  if (requiredRole === 'admin' && actualRole === 'superadmin') return true
+  return false
+}
+
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null)
   const [profile, setProfile] = useState(null)
@@ -17,9 +25,10 @@ export function AuthProvider({ children }) {
     if (error) {
       console.error('Failed to load profile', error)
       setProfile(null)
-    } else {
-      setProfile(data)
+      return null
     }
+    setProfile(data)
+    return data
   }
 
   useEffect(() => {
@@ -41,22 +50,57 @@ export function AuthProvider({ children }) {
     return () => listener.subscription.unsubscribe()
   }, [])
 
-  async function signIn(email, password) {
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    return { error }
+  // expectedRole is the role the person picked on the login screen.
+  // Every path is verified server-side (RLS + RPCs) regardless of
+  // this check, but checking it here means someone can't even land
+  // in the app under the wrong dashboard while their session is
+  // getting resolved.
+  async function signIn(email, password, expectedRole) {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+    if (error) return { error }
+
+    const user = data.user
+    const loadedProfile = await loadProfile(user.id)
+
+    if (!loadedProfile) {
+      await supabase.auth.signOut()
+      return { error: { message: 'Could not verify this account. Please contact an administrator.' } }
+    }
+
+    if (expectedRole && !roleSatisfies(loadedProfile.role, expectedRole)) {
+      await supabase.auth.signOut()
+      setProfile(null)
+      return {
+        error: {
+          message: `This account isn't registered as ${expectedRole}. Pick the correct role and try again.`
+        }
+      }
+    }
+
+    if (loadedProfile.status === 'rejected' || loadedProfile.status === 'suspended') {
+      await supabase.auth.signOut()
+      setProfile(null)
+      return { error: { message: 'Your account access has been revoked. Contact an administrator.' } }
+    }
+
+    return { error: null, profile: loadedProfile }
   }
 
-  async function signUp(email, password, fullName) {
+  // role must be 'admin' or 'cashier' — the server refuses anything
+  // else and always ignores an attempt to request 'superadmin'.
+  async function signUp(email, password, fullName, role) {
+    const requestedRole = role === 'admin' ? 'admin' : 'cashier'
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { full_name: fullName } }
+      options: { data: { full_name: fullName, requested_role: requestedRole } }
     })
     return { data, error }
   }
 
   async function signOut() {
     await supabase.auth.signOut()
+    setProfile(null)
   }
 
   const value = {
@@ -64,6 +108,8 @@ export function AuthProvider({ children }) {
     user: session?.user ?? null,
     profile,
     role: profile?.role ?? null,
+    status: profile?.status ?? null,
+    isApproved: profile?.status === 'approved',
     loading,
     signIn,
     signUp,
